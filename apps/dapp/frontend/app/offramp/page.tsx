@@ -2,6 +2,7 @@
 
 import Image from "next/image";
 import { useWallet } from "@/components/wallet-provider";
+import { useAuth } from "@/components/auth-provider";
 import { useNotifications } from "@/components/notifications-provider";
 import { AppShell } from "@/components/app-shell";
 import { useRouter } from "next/navigation";
@@ -30,7 +31,6 @@ import {
 } from "lucide-react";
 
 import { type LPNode, LP_NODES } from "@/lib/settlement-data";
-import { getExplorerTxUrl } from "@/utils/explorer";
 import { BankCombobox } from "@/components/offramp/BankCombobox";
 import { AccountNameField } from "@/components/offramp/AccountNameField";
 import { SuggestedBankChips } from "@/components/offramp/SuggestedBankChips";
@@ -43,6 +43,8 @@ import { useBankResolver } from "@/hooks/useBankResolver";
 import { fetchBankList } from "@/lib/api/bank";
 import { useOfflineStatus } from "@/hooks/useOfflineStatus";
 import { useTranslations } from "@/context/locale-context";
+import { useVaults } from "@/hooks/useVaults";
+import { api } from "@/lib/api/client";
 
 const SEND_ASSETS = [
     { symbol: "USDC", name: "USD Coin", image: "/usdc.png" },
@@ -106,31 +108,70 @@ function buildQuotes(
     return results;
 }
 
-const MOCK_BALANCE = 5000;
+// buildFormSchema is parameterized by the user's real available balance
+// (nester#1125 — this previously validated against a hardcoded MOCK_BALANCE
+// of 5000, letting a user "successfully" fill in an amount the backend would
+// reject, or blocking a legitimate withdrawal above 5000).
+function buildFormSchema(balance: number) {
+    return z.object({
+        amount: validateAmount({
+            min: 1,
+            balance,
+            maxDecimals: 6,
+            minMessage: "Minimum amount is 1 USDC",
+            balanceMessage: `Amount exceeds your balance of ${balance.toLocaleString()} USDC`,
+        }),
+        accountNumber: validateBankAccount(),
+        bankCode: z.string({ message: "Please select a bank" }).min(1, "Please select a bank"),
+    });
+}
 
-const formSchema = z.object({
-    amount: validateAmount({
-        min: 1,
-        balance: MOCK_BALANCE,
-        maxDecimals: 6,
-        minMessage: "Minimum amount is 1 USDC",
-        balanceMessage: `Amount exceeds your balance of ${MOCK_BALANCE.toLocaleString()} USDC`
-    }),
-    accountNumber: validateBankAccount(),
-    bankCode: z.string({ message: "Please select a bank" }).min(1, "Please select a bank"),
-});
-
-type FormValues = z.infer<typeof formSchema>;
+type FormValues = z.infer<ReturnType<typeof buildFormSchema>>;
 
 export default function OfframpPage() {
     const { isConnected } = useWallet();
     const { addNotification } = useNotifications();
+    const { userId } = useAuth();
     const router = useRouter();
     const { isOffline } = useOfflineStatus();
     const t = useTranslations();
 
-    // In a real app, this would come from the user's KYC state loaded via API
-    const [kycStatus] = useState<KYCStatus>("unverified");
+    // Live KYC status (nester#1125 — this previously always read "unverified"
+    // from local state and never reflected a real submission).
+    const [kycStatus, setKycStatus] = useState<KYCStatus>("unverified");
+    useEffect(() => {
+        if (!userId) return;
+        let cancelled = false;
+        api.kyc
+            .getStatus(userId)
+            .then((result) => {
+                if (!cancelled) setKycStatus(result.status);
+            })
+            .catch(() => {
+                // Leave the default "unverified" state — the KYC banner still
+                // renders correctly (prompting verification) even if the
+                // status fetch fails.
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, [userId]);
+
+    const [sendAsset, setSendAsset] = useState(SEND_ASSETS[0]);
+
+    // Live available balance (nester#1125 — this previously validated
+    // withdrawal amounts against a hardcoded MOCK_BALANCE of 5000 regardless
+    // of what the user actually held).
+    const { vaults } = useVaults(userId);
+    const availableBalance = vaults
+        .filter((v) => v.status === "active" && v.currency.toUpperCase() === sendAsset.symbol)
+        .reduce((sum, v) => sum + Number(v.current_balance || 0), 0);
+    // useForm's resolver is captured once; a ref lets the async resolver
+    // below always validate against the latest fetched balance without
+    // re-mounting the form.
+    const availableBalanceRef = useRef(availableBalance);
+    availableBalanceRef.current = availableBalance;
+    const [submitError, setSubmitError] = useState<string | null>(null);
 
     const {
         handleSubmit,
@@ -140,7 +181,8 @@ export default function OfframpPage() {
         formState: { errors, isValid, isDirty },
         trigger,
     } = useForm<FormValues>({
-        resolver: zodResolver(formSchema),
+        resolver: async (values, context, options) =>
+            zodResolver(buildFormSchema(availableBalanceRef.current))(values, context, options),
         mode: "onBlur",
         defaultValues: {
             amount: "",
@@ -153,7 +195,6 @@ export default function OfframpPage() {
     const accountNumber = watch("accountNumber");
     const selectedBankCode = watch("bankCode");
 
-    const [sendAsset, setSendAsset] = useState(SEND_ASSETS[0]);
     const [receiveCurrency, setReceiveCurrency] = useState(RECEIVE_CURRENCIES[0]);
     const [manualName, setManualName] = useState("");
     const [payoutMode, setPayoutMode] = useState<PayoutMode>({ type: "manual" });
@@ -272,7 +313,7 @@ export default function OfframpPage() {
             ? numericAmount * receiveCurrency.rate * 0.995
             : 0;
 
-    const handleWithdraw = handleSubmit((data) => {
+    const handleWithdraw = handleSubmit(async (data) => {
         if (isOffline) {
             return;
         }
@@ -281,7 +322,7 @@ export default function OfframpPage() {
             payoutMode.type === "saved"
                 ? numericAmount > 0 && quotePhase === "done" && quote
                 : isValid && quotePhase === "done" && quote;
-        if (!canSubmit || !quote) {
+        if (!canSubmit || !quote || !userId) {
             return;
         }
 
@@ -291,6 +332,18 @@ export default function OfframpPage() {
         }
 
         setShowLargeWarning(false);
+        setSubmitError(null);
+
+        // The vault this withdrawal draws from: the caller's active vault
+        // holding the send asset, matching how `availableBalance` above is
+        // computed.
+        const sourceVault = vaults.find(
+            (v) => v.status === "active" && v.currency.toUpperCase() === sendAsset.symbol
+        );
+        if (!sourceVault) {
+            setSubmitError(`No active ${sendAsset.symbol} vault to withdraw from.`);
+            return;
+        }
 
         if (payoutMode.type === "manual" && resolvedName) {
             void fetchBankList("NG").then((banks) => {
@@ -305,18 +358,41 @@ export default function OfframpPage() {
             });
         }
 
-        addNotification(
-            {
-                type: "withdrawal_processed",
-                title: "Withdrawal Submitted",
-                message: `Withdrew ${numericAmount.toLocaleString("en-US", {
-                    maximumFractionDigits: 2,
-                })} ${sendAsset.symbol} to ${accountInfo?.bank_name ?? selectedBankCode} ending in ${data.accountNumber.slice(-4)}.`,
-                actionUrl: getExplorerTxUrl(`mock-settlement-${quote.node.id}`),
-                actionLabel: "View Transaction",
-            },
-            { showToast: true }
-        );
+        // Actually submit the settlement (nester#1125 — this previously only
+        // fired a local notification with a fabricated
+        // "mock-settlement-<id>" transaction hash and never called the API,
+        // so no withdrawal was ever recorded).
+        try {
+            await api.settlements.create({
+                user_id: userId,
+                vault_id: sourceVault.id,
+                amount: numericAmount.toFixed(6),
+                currency: sendAsset.symbol,
+                fiat_currency: receiveCurrency.symbol,
+                fiat_amount: quote.receiveAmount.toFixed(2),
+                exchange_rate: quote.effectiveRate.toFixed(6),
+                destination: {
+                    type: "bank_account",
+                    provider: quote.node.name,
+                    account_number: data.accountNumber,
+                    account_name: resolvedName ?? accountInfo?.account_name ?? "",
+                    bank_code: data.bankCode,
+                },
+            });
+
+            addNotification(
+                {
+                    type: "withdrawal_processed",
+                    title: "Withdrawal Submitted",
+                    message: `Withdrew ${numericAmount.toLocaleString("en-US", {
+                        maximumFractionDigits: 2,
+                    })} ${sendAsset.symbol} to ${accountInfo?.bank_name ?? selectedBankCode} ending in ${data.accountNumber.slice(-4)}.`,
+                },
+                { showToast: true }
+            );
+        } catch (err) {
+            setSubmitError(err instanceof Error ? err.message : "Failed to submit withdrawal");
+        }
     });
 
     return (
@@ -460,7 +536,7 @@ export default function OfframpPage() {
                                 <span></span>
                             )}
                             <div className="text-xs text-muted-foreground">
-                                Balance: {MOCK_BALANCE.toLocaleString()} {sendAsset.symbol}
+                                Balance: {availableBalance.toLocaleString()} {sendAsset.symbol}
                             </div>
                         </div>
                     </div>
@@ -768,6 +844,9 @@ export default function OfframpPage() {
                                                             ? "Yes, confirm withdrawal"
                                                             : `Withdraw ${displayReceive.toLocaleString("en-US", { minimumFractionDigits: 2 })} ${receiveCurrency.symbol}`}
                         </button>
+                        {submitError && (
+                            <p className="mt-2 text-xs text-red-500">{submitError}</p>
+                        )}
                     </div>
                 </motion.div>
 

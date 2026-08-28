@@ -7,12 +7,15 @@ import { motion, AnimatePresence } from "framer-motion";
 import { ShieldCheck, User, Bell, Globe, Monitor } from "lucide-react";
 import { AppShell } from "@/components/app-shell";
 import { useWallet } from "@/components/wallet-provider";
+import { useAuth } from "@/components/auth-provider";
 import { KYCSection, type KYCStatus } from "@/components/kyc/KYCSection";
 import { BankAccountsSection } from "@/components/settings/bank-accounts-section";
 import { SessionsSection } from "@/components/settings/sessions-section";
 import { cn } from "@/lib/utils";
 import { useLocale, useTranslations } from "@/context/locale-context";
 import { SUPPORTED_LOCALES, LOCALE_LABELS, type Locale } from "@/lib/i18n/config";
+import { api } from "@/lib/api/client";
+import { SkeletonLine } from "@/components/ui/skeletons";
 
 // --- Savings goal notification settings (#740) ---
 
@@ -140,37 +143,81 @@ const TABS: { id: Tab; label: string; icon: React.ElementType }[] = [
     { id: "preferences", label: "Preferences", icon: Globe },
 ];
 
-// Mocked KYC state — in a real app this would come from an API call
-function useKYCState() {
+// Live KYC state — GET/POST /api/v1/users/kyc/{userId} (nester#1125; this
+// previously simulated a submission locally with setTimeout and never
+// persisted or reflected real verification status).
+function useKYCState(userId: string | null) {
     const [status, setStatus] = useState<KYCStatus>("unverified");
     const [submittedAt, setSubmittedAt] = useState<string | null>(null);
-    const [reviewedAt] = useState<string | null>(null);
-    const [rejectionReason] = useState<string | null>(null);
+    const [reviewedAt, setReviewedAt] = useState<string | null>(null);
+    const [rejectionReason, setRejectionReason] = useState<string | null>(null);
+    const [isLoading, setIsLoading] = useState(true);
+    const [loadError, setLoadError] = useState<string | null>(null);
     const [isSubmitting, setIsSubmitting] = useState(false);
+    const [submitError, setSubmitError] = useState<string | null>(null);
+
+    const refresh = useCallback(async () => {
+        if (!userId) {
+            setIsLoading(false);
+            return;
+        }
+        setIsLoading(true);
+        setLoadError(null);
+        try {
+            const result = await api.kyc.getStatus(userId);
+            setStatus(result.status);
+            setSubmittedAt(result.submitted_at ?? null);
+            setReviewedAt(result.reviewed_at ?? null);
+            setRejectionReason(result.rejection_reason ?? null);
+        } catch (err) {
+            setLoadError(err instanceof Error ? err.message : "Failed to load verification status");
+        } finally {
+            setIsLoading(false);
+        }
+    }, [userId]);
+
+    useEffect(() => {
+        refresh();
+    }, [refresh]);
 
     const submitKYC = async (formData: FormData) => {
+        if (!userId) return;
         setIsSubmitting(true);
+        setSubmitError(null);
         try {
-            // In a real app, POST /api/v1/users/{userId}/kyc
-            await new Promise((r) => setTimeout(r, 1200));
-            setStatus("pending");
-            setSubmittedAt(new Date().toISOString());
+            await api.kyc.submit(userId, formData);
+            await refresh();
+        } catch (err) {
+            setSubmitError(err instanceof Error ? err.message : "Failed to submit verification");
+            throw err;
         } finally {
             setIsSubmitting(false);
         }
     };
 
-    return { status, submittedAt, reviewedAt, rejectionReason, isSubmitting, submitKYC };
+    return {
+        status,
+        submittedAt,
+        reviewedAt,
+        rejectionReason,
+        isLoading,
+        loadError,
+        isSubmitting,
+        submitError,
+        submitKYC,
+        refresh,
+    };
 }
 
 export default function SettingsPage() {
     const { isConnected, address } = useWallet();
+    const { userId } = useAuth();
     const router = useRouter();
     const [activeTab, setActiveTab] = useState<Tab>("profile");
     const { locale, setLocale } = useLocale();
     const t = useTranslations();
 
-    const kyc = useKYCState();
+    const kyc = useKYCState(userId);
 
     useEffect(() => {
         if (!isConnected) router.push("/");
@@ -257,14 +304,38 @@ export default function SettingsPage() {
                                 className="rounded-2xl border border-black/8 dark:border-white/8 bg-white dark:bg-[#100F0F] p-6"
                             >
                                 <h2 className="mb-5 text-sm font-medium text-black dark:text-white">Identity Verification</h2>
-                                <KYCSection
-                                    status={kyc.status}
-                                    submittedAt={kyc.submittedAt}
-                                    reviewedAt={kyc.reviewedAt}
-                                    rejectionReason={kyc.rejectionReason}
-                                    onSubmit={kyc.submitKYC}
-                                    isSubmitting={kyc.isSubmitting}
-                                />
+                                {kyc.isLoading ? (
+                                    <div className="space-y-3">
+                                        <SkeletonLine className="h-5 w-40" />
+                                        <SkeletonLine className="h-4 w-64" />
+                                    </div>
+                                ) : kyc.loadError ? (
+                                    <div className="flex flex-col items-start gap-2">
+                                        <p className="text-sm text-red-500">
+                                            Couldn&apos;t load verification status: {kyc.loadError}
+                                        </p>
+                                        <button
+                                            onClick={() => kyc.refresh()}
+                                            className="text-xs text-black/60 dark:text-white/60 underline hover:text-black dark:hover:text-white"
+                                        >
+                                            Try again
+                                        </button>
+                                    </div>
+                                ) : (
+                                    <>
+                                        <KYCSection
+                                            status={kyc.status}
+                                            submittedAt={kyc.submittedAt}
+                                            reviewedAt={kyc.reviewedAt}
+                                            rejectionReason={kyc.rejectionReason}
+                                            onSubmit={kyc.submitKYC}
+                                            isSubmitting={kyc.isSubmitting}
+                                        />
+                                        {kyc.submitError && (
+                                            <p className="mt-3 text-sm text-red-500">{kyc.submitError}</p>
+                                        )}
+                                    </>
+                                )}
                             </motion.div>
                         )}
 
